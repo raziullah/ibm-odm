@@ -1,0 +1,17 @@
+# Production requires validated capacity, TLS and production licensing.
+license: true
+image:
+  repository: REPLACE_ECR_ODM_REPOSITORY
+  pullSecrets: [ecr-pull-secret]
+  tag: 9.6.0.0-IF003
+externalDatabase:
+  type: postgresql
+  serverName: REPLACE_RDS_ENDPOINT
+  port: 5432
+  databaseName: odmdb
+  secretCredentials: odm-db-credentials
+customization:
+  runAsUser: ""
+  deployForProduction: true
+service:
+  enableRoute: true

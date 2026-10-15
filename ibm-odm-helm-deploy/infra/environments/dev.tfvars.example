@@ -1,0 +1,16 @@
+aws_region                       = "ap-southeast-2"
+environment                      = "dev"
+codebuild_subnet_tags            = { Cluster = "rosa-automation-raz" }
+codebuild_security_group_tags    = { Name = "rosa-hcp-zed-cluster-vpc-endpoints" }
+rosa_worker_security_group_tag_key   = "Name"
+rosa_worker_security_group_tag_value = "*default-sg*"
+codecommit_repository_name       = "ibm-operators-odm-dev"
+codebuild_project_name          = "ibm-odm-bootstrap-dev"
+cluster_credentials_secret_arn   = "arn:aws:secretsmanager:ap-southeast-2:REPLACE_ACCOUNT:secret:REPLACE_CLUSTER_LOGIN"
+codecommit_git_secret_arn        = "arn:aws:secretsmanager:ap-southeast-2:REPLACE_ACCOUNT:secret:REPLACE_CODECOMMIT_GIT_CREDENTIALS"
+oc_cli_s3_uri                   = "s3://REPLACE_BUCKET/path/oc.tar.gz"
+db_engine_version                = "REPLACE_IBM_SUPPORTED_POSTGRES_VERSION"
+db_instance_class               = "db.t4g.medium"
+db_allocated_storage             = 50
+db_multi_az                      = false
+db_deletion_protection           = false

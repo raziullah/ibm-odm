@@ -1,0 +1,8 @@
+.terraform/
+*.tfstate*
+*.tfplan
+*.tfvars
+!infra/environments/*.tfvars.example
+*.tfbackend
+!infra/backend.tfbackend.example
+.DS_Store

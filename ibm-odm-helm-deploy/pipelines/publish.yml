@@ -1,0 +1,75 @@
+stages:
+  - stage: Publish
+    dependsOn: Infrastructure
+    jobs:
+      - job: CodeCommit
+        steps:
+          - task: AWSShellScript@1
+            displayName: Download, validate and publish ODM-only content
+            inputs:
+              awsCredentials: $(awsServiceConnection)
+              regionName: $(awsRegion)
+              scriptType: inline
+              inlineScript: |
+                set -Eeuo pipefail
+                trap 'status=$?; if [ "$status" -eq 0 ]; then echo "ODM publish stage completed successfully"; else echo "ODM publish stage failed with exit code $status" >&2; fi' EXIT
+
+                mkdir -p chart-input
+                helm repo add ibm-helm https://raw.githubusercontent.com/IBM/charts/master/repo/ibm-helm --force-update
+                helm repo update ibm-helm
+                rm -f chart-input/ibm-odm-prod-26.0.3.tgz
+                helm pull ibm-helm/ibm-odm-prod --version 26.0.3 --destination chart-input
+                test -f chart-input/ibm-odm-prod-26.0.3.tgz || { echo "IBM ODM chart 26.0.3 was not downloaded" >&2; exit 1; }
+
+                export AWS_REGION="$(awsRegion)"
+                source scripts/bootstrap_tf_backend.sh
+                terraform -chdir=infra init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="key=ibm-odm/dev/terraform.tfstate" -backend-config="region=$AWS_REGION" -backend-config="encrypt=true" -backend-config="use_lockfile=true"
+                terraform -chdir=infra validate
+                RDS_ENDPOINT="$(terraform -chdir=infra output -raw rds_endpoint)"
+                RDS_SECRET="$(terraform -chdir=infra output -raw rds_master_secret_arn)"
+                REPO_URL="$(terraform -chdir=infra output -raw codecommit_url)"
+                CODECOMMIT_SECRET="$(terraform -chdir=infra output -raw codecommit_git_secret_arn)"
+
+                rm -rf /tmp/odm-render /tmp/odm-repo
+                mkdir -p /tmp/odm-render
+                cp -R codecommit-content/ibm-odm/. /tmp/odm-render/
+                mkdir -p /tmp/odm-render/chart
+                tar -xzf chart-input/ibm-odm-prod-26.0.3.tgz -C /tmp/odm-render/chart
+                test -f /tmp/odm-render/chart/ibm-odm-prod/Chart.yaml || { echo "Downloaded chart archive has unexpected contents" >&2; exit 1; }
+                cp /tmp/odm-render/values/dev.yaml /tmp/odm-render/chart/ibm-odm-prod/values-dev.yaml
+                sed -i "s|REPLACE_RDS_ENDPOINT|$RDS_ENDPOINT|g" /tmp/odm-render/chart/ibm-odm-prod/values-dev.yaml
+                sed -i "s|REPLACE_RDS_MASTER_SECRET_ARN|$RDS_SECRET|g" /tmp/odm-render/external-secrets/rds-master.yaml
+                sed -i "s|REPLACE_CODECOMMIT_URL|$REPO_URL|g" /tmp/odm-render/argocd/project.yaml /tmp/odm-render/argocd/application.yaml /tmp/odm-render/external-secrets/argocd-codecommit.yaml
+                sed -i "s|REPLACE_CODECOMMIT_GIT_SECRET_ARN|$CODECOMMIT_SECRET|g" /tmp/odm-render/external-secrets/argocd-codecommit.yaml
+                if grep -R -nE 'REPLACE_(RDS_ENDPOINT|RDS_MASTER_SECRET_ARN|CODECOMMIT_URL|CODECOMMIT_GIT_SECRET_ARN)' /tmp/odm-render; then
+                  echo "Unresolved deployment placeholders remain" >&2
+                  exit 1
+                fi
+                python3 -c "import yaml" || { echo "PyYAML is required on ADO runner" >&2; exit 1; }
+                helm show values chart-input/ibm-odm-prod-26.0.3.tgz > /tmp/odm-chart-defaults.yaml
+                python3 scripts/validate_odm.py schema /tmp/odm-chart-defaults.yaml /tmp/odm-render/chart/ibm-odm-prod/values-dev.yaml
+                helm lint /tmp/odm-render/chart/ibm-odm-prod -f /tmp/odm-render/chart/ibm-odm-prod/values-dev.yaml
+                helm template ibm-odm /tmp/odm-render/chart/ibm-odm-prod -n ibm-odm -f /tmp/odm-render/chart/ibm-odm-prod/values-dev.yaml >/tmp/odm-rendered.yaml
+                test -s /tmp/odm-rendered.yaml || { echo "Helm rendered no Kubernetes resources" >&2; exit 1; }
+                python3 scripts/validate_odm.py rendered /tmp/odm-rendered.yaml /tmp/odm-render/chart/ibm-odm-prod/values-dev.yaml
+                # Fail closed on every rendered image: verify the repository and exact tag in ECR.
+                python3 scripts/check_ecr_images.py /tmp/odm-rendered.yaml 986454734902 ap-southeast-2
+
+
+                git config --global credential.helper '!aws codecommit credential-helper $@'
+                git config --global credential.UseHttpPath true
+                git clone "$REPO_URL" /tmp/odm-repo
+                mkdir -p /tmp/odm-repo/ibm-odm
+                # --delete is deliberately scoped to ibm-odm/; all shared-repository siblings remain untouched.
+                rsync -a --delete /tmp/odm-render/ /tmp/odm-repo/ibm-odm/
+                cd /tmp/odm-repo
+                git config user.name "Azure Pipelines"
+                git config user.email "azure-pipelines@local"
+                # Stage only the ODM subtree; do not stage shared repository content at its root.
+                git add -- ibm-odm/
+                if ! git diff --cached --quiet; then
+                  git commit -m "Publish IBM ODM Helm dev"
+                  git push origin HEAD:main
+                else
+                  echo "No ODM content changes to publish"
+                fi

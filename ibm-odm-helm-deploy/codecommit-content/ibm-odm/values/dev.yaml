@@ -1,0 +1,32 @@
+# Copied to chart/ibm-odm-prod/values-dev.yaml by the publishing pipeline.
+# Chart 26.0.3 must be supplied separately; validate with helm template.
+license: true
+image:
+  repository: 986454734902.dkr.ecr.ap-southeast-2.amazonaws.com/cp/cp4a/odm/
+  # Publish validates every rendered image with ECR DescribeImages.
+  tag: 9.6.0.0-IF003
+externalDatabase:
+  type: postgresql
+  serverName: REPLACE_RDS_ENDPOINT
+  port: 5432
+  databaseName: odmdb
+  secretCredentials: odm-db-credentials
+  # Fail-closed validation checks rendered workloads for PostgreSQL TLS.
+  # Confirm this chart-specific setting is consumed by chart 26.0.3.
+  sslMode: require
+customization:
+  runAsUser: ""
+  deployForProduction: false
+service:
+  enableRoute: true
+# These are candidate chart-level keys. The publish validator rejects the
+# deployment unless they are present in the downloaded chart schema and every
+# rendered workload has the intended architecture and IBM toleration.
+nodeSelector:
+  kubernetes.io/arch: amd64
+  workload: ibm
+tolerations:
+  - key: workload
+    operator: Equal
+    value: ibm
+    effect: NoSchedule

@@ -1,0 +1,22 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: odm-database
+  namespace: ibm-odm
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: aws-secrets-manager
+  target:
+    name: odm-db-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: db-user
+      remoteRef:
+        key: REPLACE_RDS_MASTER_SECRET_ARN
+        property: username
+    - secretKey: db-password
+      remoteRef:
+        key: REPLACE_RDS_MASTER_SECRET_ARN
+        property: password

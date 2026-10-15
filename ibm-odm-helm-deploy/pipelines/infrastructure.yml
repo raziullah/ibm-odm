@@ -1,0 +1,91 @@
+stages:
+  - stage: Infrastructure
+    displayName: Terraform RDS and bootstrap
+    jobs:
+      - job: Apply
+        steps:
+          # Upload this file once as an Azure DevOps Secure File. It is intentionally gitignored.
+          - task: DownloadSecureFile@1
+            name: devTfvars
+            displayName: Download private dev Terraform variables
+            inputs:
+              secureFile: ibm-odm-dev.tfvars
+          - task: AWSShellScript@1
+            displayName: Import existing dev resources, validate and apply Terraform
+            inputs:
+              awsCredentials: $(awsServiceConnection)
+              regionName: $(awsRegion)
+              scriptType: inline
+              inlineScript: |
+                set -Eeuo pipefail
+                trap 'status=$?; if [ "$status" -eq 0 ]; then echo "Infrastructure stage completed successfully"; else echo "Infrastructure stage failed with exit code $status" >&2; fi' EXIT
+                install -m 0600 "$(devTfvars.secureFilePath)" infra/environments/dev.tfvars
+
+                export AWS_REGION="$(awsRegion)"
+                source scripts/bootstrap_tf_backend.sh
+                terraform -chdir=infra init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="key=ibm-odm/dev/terraform.tfstate" -backend-config="region=$AWS_REGION" -backend-config="encrypt=true" -backend-config="use_lockfile=true"
+                terraform -chdir=infra fmt -check -recursive
+                terraform -chdir=infra validate
+
+                # Import only deterministic ODM resources that already exist and are absent from state.
+                # This avoids first-run AlreadyExists failures while leaving shared resources unmanaged.
+                state_has() {
+                  terraform -chdir=infra state list | grep -Fqx "$1"
+                }
+                import_if_missing() {
+                  address="$1"
+                  resource_id="$2"
+                  if [ -n "$resource_id" ] && [ "$resource_id" != "None" ] && ! state_has "$address"; then
+                    echo "Importing existing resource $address"
+                    terraform -chdir=infra import -input=false -var-file=environments/dev.tfvars "$address" "$resource_id"
+                  fi
+                }
+                rds_id="ibm-odm-dev"
+                subnet_group="ibm-odm-dev"
+                parameter_group="ibm-odm-dev"
+                rds_sg_name="ibm-odm-rds-dev"
+                project_name="ibm-odm-bootstrap-dev"
+                log_group="/aws/codebuild/ibm-odm-bootstrap-dev"
+
+                if aws rds describe-db-subnet-groups --db-subnet-group-name "$subnet_group" >/dev/null 2>&1; then
+                  import_if_missing aws_db_subnet_group.odm "$subnet_group"
+                fi
+                if aws rds describe-db-parameter-groups --db-parameter-group-name "$parameter_group" >/dev/null 2>&1; then
+                  import_if_missing aws_db_parameter_group.odm "$parameter_group"
+                fi
+                rds_sg_id="$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$(terraform -chdir=infra output -raw discovered_vpc_id 2>/dev/null || true)" "Name=group-name,Values=$rds_sg_name" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)"
+                if [ -z "$rds_sg_id" ] || [ "$rds_sg_id" = "None" ]; then
+                  rds_sg_id="$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$rds_sg_name" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)"
+                fi
+                import_if_missing aws_security_group.rds "$rds_sg_id"
+
+                if [ -n "$rds_sg_id" ] && [ "$rds_sg_id" != "None" ]; then
+                  worker_tag_key="$(sed -n 's/^[[:space:]]*rosa_worker_security_group_tag_key[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' infra/environments/dev.tfvars | head -n 1)"
+                  worker_tag_value="$(sed -n 's/^[[:space:]]*rosa_worker_security_group_tag_value[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' infra/environments/dev.tfvars | head -n 1)"
+                  worker_tag_key="${worker_tag_key:-Name}"
+                  worker_tag_value="${worker_tag_value:-*default-sg*}"
+                  worker_sg_candidates="$(aws ec2 describe-security-groups --filters "Name=tag:$worker_tag_key,Values=$worker_tag_value" --query 'SecurityGroups[].GroupId' --output text)"
+                  existing_rule=""
+                  for candidate_sg_id in $worker_sg_candidates; do
+                    candidate_rule="$(aws ec2 describe-security-group-rules --filters "Name=group-id,Values=$rds_sg_id" --output json | jq -r --arg worker "$candidate_sg_id" '.SecurityGroupRules[] | select(.IsEgress == false and .IpProtocol == "tcp" and .FromPort == 5432 and .ToPort == 5432 and .ReferencedGroupInfo.GroupId == $worker) | .SecurityGroupRuleId' | head -n 1)"
+                    if [ -n "$candidate_rule" ]; then
+                      if [ -n "$existing_rule" ]; then
+                        echo "More than one matching worker-SG ingress rule exists on the RDS SG; resolve the duplicate rules before applying." >&2
+                        exit 1
+                      fi
+                      existing_rule="$candidate_rule"
+                    fi
+                  done
+                  import_if_missing aws_vpc_security_group_ingress_rule.from_rosa_workers "$existing_rule"
+                fi
+
+                if aws rds describe-db-instances --db-instance-identifier "$rds_id" >/dev/null 2>&1; then
+                  import_if_missing aws_db_instance.odm "$rds_id"
+                fi
+                existing_log_group="$(aws logs describe-log-groups --log-group-name-prefix "$log_group" --output json 2>/dev/null | jq -r --arg name "$log_group" '.logGroups[] | select(.logGroupName == $name) | .logGroupName' | head -n 1 || true)"
+                import_if_missing aws_cloudwatch_log_group.bootstrap "$existing_log_group"
+                existing_project="$(aws codebuild batch-get-projects --names "$project_name" --query 'projects[0].name' --output text 2>/dev/null || true)"
+                import_if_missing aws_codebuild_project.bootstrap "$existing_project"
+
+                terraform -chdir=infra plan -input=false -var-file=environments/dev.tfvars -out=tfplan
+                terraform -chdir=infra apply -input=false -auto-approve tfplan

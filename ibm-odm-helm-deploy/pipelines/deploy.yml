@@ -1,0 +1,35 @@
+stages:
+  - stage: Bootstrap
+    dependsOn: Publish
+    jobs:
+      - job: CodeBuild
+        steps:
+          - task: AWSShellScript@1
+            displayName: Run ODM bootstrap CodeBuild
+            inputs:
+              awsCredentials: $(awsServiceConnection)
+              regionName: $(awsRegion)
+              scriptType: inline
+              inlineScript: |
+                set -Eeuo pipefail
+                trap 'status=$?; if [ "$status" -eq 0 ]; then echo "Bootstrap stage completed successfully"; else echo "Bootstrap stage failed with exit code $status" >&2; fi' EXIT
+
+                project="ibm-odm-bootstrap-$(environment)"
+                build_id="$(aws codebuild start-build --project-name "$project" --query build.id --output text)"
+                echo "CodeBuild started: $build_id"
+                while :; do
+                  status="$(aws codebuild batch-get-builds --ids "$build_id" --query 'builds[0].buildStatus' --output text)"
+                  case "$status" in
+                    SUCCEEDED)
+                      echo "CodeBuild reports success"
+                      break
+                      ;;
+                    FAILED|FAULT|STOPPED|TIMED_OUT)
+                      echo "CodeBuild failed: $status" >&2
+                      exit 1
+                      ;;
+                    *)
+                      sleep 15
+                      ;;
+                  esac
+                done

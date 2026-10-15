@@ -1,0 +1,58 @@
+version: 0.2
+phases:
+  build:
+    commands:
+      - |
+        set -Eeuo pipefail
+        trap 'status=$?; if [ "$status" -eq 0 ]; then echo "ODM bootstrap completed successfully"; else echo "ODM bootstrap failed with exit code $status" >&2; fi' EXIT
+
+        test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED_AWS_ACCOUNT_ID" || { echo "AWS account validation failed" >&2; exit 1; }
+        test "$DEPLOY_ENV" = dev || { echo "Only dev bootstrap is enabled in this buildspec" >&2; exit 1; }
+        test -f ibm-odm/chart/ibm-odm-prod/Chart.yaml || { echo "Published IBM ODM Helm chart is missing" >&2; exit 1; }
+
+        mkdir -p /tmp/odm-oc
+        aws s3 cp "$OC_S3_URI" /tmp/odm-oc/oc.tar.gz
+        tar -xzf /tmp/odm-oc/oc.tar.gz -C /tmp/odm-oc
+        OC_BINARY="$(find /tmp/odm-oc -type f -name oc | head -n 1)"
+        test -n "$OC_BINARY" || { echo "oc binary was not found in the downloaded archive" >&2; exit 1; }
+        install -m 0755 "$OC_BINARY" /usr/local/bin/oc
+        oc version --client
+
+        SECRET_JSON="$(aws secretsmanager get-secret-value --secret-id "$CLUSTER_CREDENTIALS_SECRET" --query SecretString --output text)"
+        CLUSTER_API="$(printf "%s" "$SECRET_JSON" | jq -r ".api_url")"
+        CLUSTER_USER="$(printf "%s" "$SECRET_JSON" | jq -r ".username")"
+        CLUSTER_PASS="$(printf "%s" "$SECRET_JSON" | jq -r ".password")"
+        test -n "$CLUSTER_API" && test -n "$CLUSTER_USER" && test -n "$CLUSTER_PASS" || { echo "Cluster credential fields are missing" >&2; exit 1; }
+        oc login "$CLUSTER_API" -u "$CLUSTER_USER" -p "$CLUSTER_PASS" >/dev/null
+
+        oc apply -f ibm-odm/namespace/namespace.yaml
+        # Opt this namespace into OpenShift GitOps management and grant only namespace-scoped access.
+        oc apply -f ibm-odm/rbac/argocd-rolebinding.yaml
+        # Verify the effective controller access without requiring impersonation privileges.
+        # `oc auth can-i --as` is optional and is not used as a hard gate here.
+        oc get rolebinding ibm-odm-argocd -n ibm-odm -o name
+        oc get namespace ibm-odm -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/managed-by}' | grep -qx 'openshift-gitops' || { echo 'GitOps namespace label missing' >&2; exit 1; }
+        oc apply -f ibm-odm/external-secrets/rds-master.yaml
+        oc wait externalsecret/odm-database -n ibm-odm --for=condition=Ready --timeout=240s
+        oc get secret odm-db-credentials -n ibm-odm -o name >/dev/null || { echo "RDS credential Secret was not created" >&2; exit 1; }
+        # Private ECR images are pulled with the ROSA worker-node ECR credential provider.
+        # Never persist a 12-hour aws ecr get-login-password token as a static Kubernetes Secret.
+        oc get nodes -l 'kubernetes.io/arch=amd64,workload=ibm' -o name | grep -q . || { echo "No labeled amd64 IBM worker nodes found" >&2; exit 1; }
+
+        # ESO materializes the HTTPS Git credentials as an Argo CD repository Secret.
+        oc apply -f ibm-odm/external-secrets/argocd-codecommit.yaml
+        oc wait externalsecret/ibm-odm-codecommit -n openshift-gitops --for=condition=Ready --timeout=240s
+        oc get secret ibm-odm-codecommit -n openshift-gitops -o json | jq -e '.metadata.labels["argocd.argoproj.io/secret-type"] == "repository" and .data.username != null and .data.password != null and .data.url != null' >/dev/null || { echo "Argo CD CodeCommit repository Secret validation failed" >&2; exit 1; }
+
+        oc apply -f ibm-odm/argocd/project.yaml
+        oc apply -f ibm-odm/argocd/application.yaml
+        oc get application ibm-odm -n openshift-gitops -o name
+
+        # Fail if the GitOps application does not reconcile and become healthy.
+        oc wait application/ibm-odm -n openshift-gitops --for=jsonpath='{.status.sync.status}'=Synced --timeout=900s
+        oc wait application/ibm-odm -n openshift-gitops --for=jsonpath='{.status.health.status}'=Healthy --timeout=900s
+        oc rollout status deployment -n ibm-odm --all --timeout=600s
+        oc rollout status statefulset -n ibm-odm --all --timeout=600s
+        # Ensure the application actually deployed at least one workload.
+        test "$(oc get deployment,statefulset -n ibm-odm -o name | wc -l)" -gt 0 || { echo "No ODM workloads found" >&2; exit 1; }
+        oc get pods -n ibm-odm -o wide

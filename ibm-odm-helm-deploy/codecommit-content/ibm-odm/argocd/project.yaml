@@ -1,0 +1,13 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: ibm-odm
+  namespace: openshift-gitops
+spec:
+  description: IBM ODM Helm deployment
+  sourceRepos:
+    - REPLACE_CODECOMMIT_URL
+  destinations:
+    - namespace: ibm-odm
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist: []

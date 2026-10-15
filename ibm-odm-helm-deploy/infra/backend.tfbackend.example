@@ -1,0 +1,6 @@
+# Created automatically by scripts/bootstrap_tf_backend.sh in ADO.
+# Bucket: ibm-odm-dev-tfstate-<AWS_ACCOUNT_ID>-ap-southeast-2
+key            = "ibm-odm/dev/terraform.tfstate"
+region         = "ap-southeast-2"
+encrypt        = true
+use_lockfile   = true

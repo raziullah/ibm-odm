@@ -1,0 +1,20 @@
+trigger: none
+pr: none
+parameters:
+  - name: environment
+    type: string
+    default: dev
+    values: [dev]
+variables:
+  - name: awsRegion
+    value: ap-southeast-2
+  - name: awsServiceConnection
+    value: rosa-hcp-ze-sc
+  - name: codecommitRepo
+    value: ibm-operators-odm-dev
+pool:
+  vmImage: ubuntu-latest
+stages:
+  - template: pipelines/infrastructure.yml
+  - template: pipelines/publish.yml
+  - template: pipelines/deploy.yml
